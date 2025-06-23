@@ -1,0 +1,827 @@
+#!/bin/bash
+
+# Скрипт установки админ-панели для управления прокси-серверами
+# Ubuntu 22.04
+
+set -e
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Функция для вывода сообщений
+log() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Проверка прав root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "Этот скрипт должен быть запущен с правами root"
+        exit 1
+    fi
+}
+
+# Установка зависимостей
+install_dependencies() {
+    log "Обновление системы и установка зависимостей..."
+    
+    apt update && apt upgrade -y
+    apt install -y nginx php8.1-fpm php8.1-mysql php8.1-curl php8.1-mbstring php8.1-xml php8.1-zip \
+                   mysql-server openssh-client sshpass curl wget unzip git dante-server squid apache2-utils \
+                   python3 python3-pip
+    
+    # Установка Composer
+    curl -sS https://getcomposer.org/installer | php
+    mv composer.phar /usr/local/bin/composer
+    chmod +x /usr/local/bin/composer
+    
+    log "Зависимости установлены"
+}
+
+# Настройка MySQL
+setup_mysql() {
+    log "Настройка MySQL..."
+    
+    # Генерация паролей
+    DB_ROOT_PASS=$(openssl rand -base64 32)
+    DB_USER_PASS=$(openssl rand -base64 32)
+    
+    # Настройка MySQL
+    mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$DB_ROOT_PASS';"
+    mysql -u root -p$DB_ROOT_PASS -e "CREATE DATABASE proxy_admin;"
+    mysql -u root -p$DB_ROOT_PASS -e "CREATE USER 'proxy_user'@'localhost' IDENTIFIED BY '$DB_USER_PASS';"
+    mysql -u root -p$DB_ROOT_PASS -e "GRANT ALL PRIVILEGES ON proxy_admin.* TO 'proxy_user'@'localhost';"
+    mysql -u root -p$DB_ROOT_PASS -e "FLUSH PRIVILEGES;"
+    
+    # Сохранение паролей
+    cat > /root/db_credentials.txt << EOF
+MySQL Root Password: $DB_ROOT_PASS
+Database: proxy_admin
+User: proxy_user
+Password: $DB_USER_PASS
+EOF
+    
+    log "MySQL настроен"
+}
+
+# Создание структуры веб-приложения
+create_web_app() {
+    log "Создание веб-приложения..."
+    
+    # Создание директорий
+    mkdir -p /var/www/proxy-admin/{public,src,config,logs,scripts}
+    cd /var/www/proxy-admin
+    
+    # Создание базы данных
+    mysql -u root -p$DB_ROOT_PASS proxy_admin << 'EOF'
+CREATE TABLE IF NOT EXISTS admin_users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS servers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    ip VARCHAR(45) NOT NULL,
+    port INT DEFAULT 22,
+    username VARCHAR(50) DEFAULT 'root',
+    password VARCHAR(255),
+    ssh_key TEXT,
+    status ENUM('active', 'inactive', 'error') DEFAULT 'inactive',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS proxies (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    server_id INT,
+    type ENUM('http', 'socks5') NOT NULL,
+    ip VARCHAR(45) NOT NULL,
+    port INT NOT NULL,
+    username VARCHAR(50),
+    password VARCHAR(255),
+    status ENUM('active', 'inactive', 'error') DEFAULT 'inactive',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+);
+EOF
+
+    # Создание конфигурации
+    cat > config/database.php << EOF
+<?php
+return [
+    'host' => 'localhost',
+    'dbname' => 'proxy_admin',
+    'username' => 'proxy_user',
+    'password' => '$DB_USER_PASS'
+];
+EOF
+
+    # Создание основного класса для работы с БД
+    cat > src/Database.php << 'EOF'
+<?php
+class Database {
+    private $pdo;
+    
+    public function __construct() {
+        $config = require __DIR__ . '/../config/database.php';
+        $dsn = "mysql:host={$config['host']};dbname={$config['dbname']};charset=utf8mb4";
+        
+        $this->pdo = new PDO($dsn, $config['username'], $config['password'], [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+        ]);
+    }
+    
+    public function query($sql, $params = []) {
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt;
+    }
+    
+    public function fetchAll($sql, $params = []) {
+        return $this->query($sql, $params)->fetchAll();
+    }
+    
+    public function fetch($sql, $params = []) {
+        return $this->query($sql, $params)->fetch();
+    }
+    
+    public function lastInsertId() {
+        return $this->pdo->lastInsertId();
+    }
+}
+EOF
+
+    # Создание главной страницы
+    cat > public/index.php << 'EOF'
+<?php
+session_start();
+require_once '../src/Database.php';
+
+$db = new Database();
+
+// Проверка авторизации
+if (!isset($_SESSION['admin_logged_in'])) {
+    header('Location: login.php');
+    exit;
+}
+
+// Получение данных
+$servers = $db->fetchAll("SELECT * FROM servers ORDER BY created_at DESC");
+$proxies = $db->fetchAll("
+    SELECT p.*, s.name as server_name, s.ip as server_ip 
+    FROM proxies p 
+    LEFT JOIN servers s ON p.server_id = s.id 
+    ORDER BY p.created_at DESC
+");
+?>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Панель управления прокси</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: #333; color: white; padding: 20px; text-align: center; }
+        .nav { background: #444; padding: 10px 0; }
+        .nav ul { list-style: none; display: flex; justify-content: center; }
+        .nav li { margin: 0 20px; }
+        .nav a { color: white; text-decoration: none; padding: 10px 15px; border-radius: 5px; }
+        .nav a:hover { background: #555; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin: 5px; }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-warning { background: #ffc107; color: black; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .status-active { color: #28a745; font-weight: bold; }
+        .status-inactive { color: #6c757d; }
+        .status-error { color: #dc3545; font-weight: bold; }
+        .form-group { margin: 15px 0; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        .logout { float: right; }
+        .generate-btn { 
+            margin-top: 5px;
+            background: #6c757d;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Панель управления прокси-серверами</h1>
+        <a href="logout.php" class="btn btn-danger logout">Выход</a>
+    </div>
+    
+    <div class="nav">
+        <ul>
+            <li><a href="#servers">Серверы</a></li>
+            <li><a href="#proxies">Прокси</a></li>
+            <li><a href="#logs">Логи</a></li>
+        </ul>
+    </div>
+    
+    <div class="container">
+        <!-- Серверы -->
+        <div class="card" id="servers">
+            <h2>Управление серверами</h2>
+            <button class="btn btn-success" onclick="showAddServerForm()">Добавить сервер</button>
+            
+            <div id="addServerForm" style="display: none; margin-top: 20px;">
+                <form method="POST" action="actions.php">
+                    <input type="hidden" name="action" value="add_server">
+                    <div class="form-group">
+                        <label>Название сервера:</label>
+                        <input type="text" name="name" required>
+                    </div>
+                    <div class="form-group">
+                        <label>IP адрес:</label>
+                        <input type="text" name="ip" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Пароль root:</label>
+                        <input type="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Добавить</button>
+                    <button type="button" class="btn btn-warning" onclick="hideAddServerForm()">Отмена</button>
+                </form>
+            </div>
+            
+            <table style="margin-top: 20px;">
+                <thead>
+                    <tr>
+                        <th>Название</th>
+                        <th>IP</th>
+                        <th>Статус</th>
+                        <th>Дата добавления</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($servers as $server): ?>
+                    <tr>
+                        <td><?= htmlspecialchars($server['name']) ?></td>
+                        <td><?= htmlspecialchars($server['ip']) ?></td>
+                        <td class="status-<?= $server['status'] ?>"><?= ucfirst($server['status']) ?></td>
+                        <td><?= date('d.m.Y H:i', strtotime($server['created_at'])) ?></td>
+                        <td>
+                            <a href="actions.php?action=test_server&id=<?= $server['id'] ?>" class="btn btn-primary">Тест</a>
+                            <a href="actions.php?action=delete_server&id=<?= $server['id'] ?>" class="btn btn-danger" onclick="return confirm('Удалить сервер?')">Удалить</a>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Прокси -->
+        <div class="card" id="proxies">
+            <h2>Управление прокси</h2>
+            <button class="btn btn-success" onclick="showAddProxyForm()">Создать прокси</button>
+            
+            <div id="addProxyForm" style="display: none; margin-top: 20px;">
+                <form method="POST" action="actions.php">
+                    <input type="hidden" name="action" value="create_proxy">
+                    <div class="form-group">
+                        <label>Сервер:</label>
+                        <select name="server_id" required>
+                            <option value="">Выберите сервер</option>
+                            <?php foreach ($servers as $server): ?>
+                                <?php if ($server['status'] == 'active'): ?>
+                                <option value="<?= $server['id'] ?>"><?= htmlspecialchars($server['name']) ?> (<?= $server['ip'] ?>)</option>
+                                <?php endif; ?>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Тип прокси:</label>
+                        <select name="type" required>
+                            <option value="http">HTTP</option>
+                            <option value="socks5">SOCKS5</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Порт:</label>
+                        <input type="number" name="port" min="1024" max="65535" required>
+                        <button type="button" class="generate-btn" onclick="generatePort()">Сгенерировать</button>
+                    </div>
+                    <div class="form-group">
+                        <label>Имя пользователя:</label>
+                        <input type="text" name="username" required>
+                        <button type="button" class="generate-btn" onclick="generateUsername()">Сгенерировать</button>
+                    </div>
+                    <div class="form-group">
+                        <label>Пароль:</label>
+                        <input type="password" name="proxy_password" required>
+                        <button type="button" class="generate-btn" onclick="generatePassword()">Сгенерировать</button>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Создать</button>
+                    <button type="button" class="btn btn-warning" onclick="hideAddProxyForm()">Отмена</button>
+                </form>
+            </div>
+            
+            <table style="margin-top: 20px;">
+                <thead>
+                    <tr>
+                        <th>Сервер</th>
+                        <th>Тип</th>
+                        <th>Адрес</th>
+                        <th>Порт</th>
+                        <th>Логин</th>
+                        <th>Пароль</th>
+                        <th>Статус</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($proxies as $proxy): ?>
+                    <tr>
+                        <td><?= htmlspecialchars($proxy['server_name']) ?></td>
+                        <td><?= strtoupper($proxy['type']) ?></td>
+                        <td><?= htmlspecialchars($proxy['ip']) ?></td>
+                        <td><?= $proxy['port'] ?></td>
+                        <td><?= htmlspecialchars($proxy['username']) ?></td>
+                        <td><?= htmlspecialchars($proxy['password']) ?></td>
+                        <td class="status-<?= $proxy['status'] ?>"><?= ucfirst($proxy['status']) ?></td>
+                        <td>
+                            <a href="actions.php?action=test_proxy&id=<?= $proxy['id'] ?>" class="btn btn-primary">Тест</a>
+                            <a href="actions.php?action=stop_proxy&id=<?= $proxy['id'] ?>" class="btn btn-warning">Остановить</a>
+                            <a href="actions.php?action=delete_proxy&id=<?= $proxy['id'] ?>" class="btn btn-danger" onclick="return confirm('Удалить прокси?')">Удалить</a>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <script>
+        function showAddServerForm() {
+            document.getElementById('addServerForm').style.display = 'block';
+        }
+        
+        function hideAddServerForm() {
+            document.getElementById('addServerForm').style.display = 'none';
+        }
+        
+        function showAddProxyForm() {
+            document.getElementById('addProxyForm').style.display = 'block';
+            generateProxyData();
+        }
+        
+        function hideAddProxyForm() {
+            document.getElementById('addProxyForm').style.display = 'none';
+        }
+        
+        function generateRandomString(length) {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let result = '';
+            for (let i = 0; i < length; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        }
+        
+        function generatePort() {
+            document.querySelector('input[name="port"]').value = Math.floor(Math.random() * 50000) + 10000;
+        }
+        
+        function generateUsername() {
+            document.querySelector('input[name="username"]').value = generateRandomString(8);
+        }
+        
+        function generatePassword() {
+            document.querySelector('input[name="proxy_password"]').value = generateRandomString(12);
+        }
+        
+        function generateProxyData() {
+            generatePort();
+            generateUsername();
+            generatePassword();
+        }
+    </script>
+</body>
+</html>
+EOF
+
+    # Создание страницы авторизации
+    cat > public/login.php << 'EOF'
+<?php
+session_start();
+require_once '../src/Database.php';
+
+if ($_POST) {
+    $db = new Database();
+    $username = $_POST['username'] ?? '';
+    $password = $_POST['password'] ?? '';
+    
+    $user = $db->fetch("SELECT * FROM admin_users WHERE username = ?", [$username]);
+    
+    if ($user && password_verify($password, $user['password'])) {
+        $_SESSION['admin_logged_in'] = true;
+        $_SESSION['admin_username'] = $username;
+        header('Location: index.php');
+        exit;
+    } else {
+        $error = 'Неверный логин или пароль';
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Авторизация</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .login-form { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 15px 35px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+        .login-form h2 { text-align: center; margin-bottom: 30px; color: #333; }
+        .form-group { margin: 20px 0; }
+        .form-group label { display: block; margin-bottom: 8px; font-weight: bold; color: #555; }
+        .form-group input { width: 100%; padding: 12px; border: 2px solid #ddd; border-radius: 5px; font-size: 16px; }
+        .form-group input:focus { border-color: #667eea; outline: none; }
+        .btn { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 20px; }
+        .btn:hover { background: #5a6fd8; }
+        .error { color: #dc3545; text-align: center; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="login-form">
+        <h2>Авторизация</h2>
+        <form method="POST">
+            <div class="form-group">
+                <label>Логин:</label>
+                <input type="text" name="username" required>
+            </div>
+            <div class="form-group">
+                <label>Пароль:</label>
+                <input type="password" name="password" required>
+            </div>
+            <button type="submit" class="btn">Войти</button>
+            <?php if (isset($error)): ?>
+                <div class="error"><?= $error ?></div>
+            <?php endif; ?>
+        </form>
+    </div>
+</body>
+</html>
+EOF
+
+    # Создание файла действий
+    cat > public/actions.php << 'EOF'
+<?php
+session_start();
+require_once '../src/Database.php';
+
+if (!isset($_SESSION['admin_logged_in'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$db = new Database();
+$action = $_GET['action'] ?? $_POST['action'] ?? '';
+
+switch ($action) {
+    case 'add_server':
+        $name = $_POST['name'];
+        $ip = $_POST['ip'];
+        $password = $_POST['password'];
+        
+        // Тест подключения
+        $test_cmd = "sshpass -p '$password' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$ip 'echo connected' 2>&1";
+        $output = shell_exec($test_cmd);
+        $status = (strpos($output, 'connected') !== false) ? 'active' : 'error';
+        
+        $db->query("INSERT INTO servers (name, ip, password, status) VALUES (?, ?, ?, ?)", 
+                   [$name, $ip, $password, $status]);
+        
+        header('Location: index.php');
+        break;
+        
+    case 'test_server':
+        $id = $_GET['id'];
+        $server = $db->fetch("SELECT * FROM servers WHERE id = ?", [$id]);
+        
+        if ($server) {
+            $test_cmd = "sshpass -p '{$server['password']}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{$server['ip']} 'echo connected' 2>&1";
+            $output = shell_exec($test_cmd);
+            $status = (strpos($output, 'connected') !== false) ? 'active' : 'error';
+            
+            $db->query("UPDATE servers SET status = ? WHERE id = ?", [$status, $id]);
+        }
+        
+        header('Location: index.php');
+        break;
+        
+    case 'delete_server':
+        $id = $_GET['id'];
+        $db->query("DELETE FROM servers WHERE id = ?", [$id]);
+        header('Location: index.php');
+        break;
+        
+    case 'create_proxy':
+        $server_id = $_POST['server_id'];
+        $type = $_POST['type'];
+        $port = $_POST['port'];
+        $username = $_POST['username'];
+        $proxy_password = $_POST['proxy_password'];
+        
+        $server = $db->fetch("SELECT * FROM servers WHERE id = ?", [$server_id]);
+        
+        if ($server) {
+            // Создание прокси на сервере
+            $script_path = "/tmp/setup_proxy_" . uniqid() . ".sh";
+            
+            if ($type == 'http') {
+                $script_content = "#!/bin/bash
+apt update
+apt install -y squid apache2-utils
+htpasswd -bc /etc/squid/passwd $username $proxy_password
+cat > /etc/squid/squid.conf << 'SQUID_EOF'
+http_port $port
+auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
+auth_param basic children 5
+auth_param basic realm Squid proxy-caching web server
+auth_param basic credentialsttl 2 hours
+acl authenticated proxy_auth REQUIRED
+http_access allow authenticated
+http_access deny all
+SQUID_EOF
+systemctl restart squid
+systemctl enable squid
+";
+            } else {
+                $script_content = "#!/bin/bash
+apt update
+apt install -y dante-server
+cat > /etc/danted.conf << 'DANTE_EOF'
+logoutput: /var/log/socks.log
+internal: 0.0.0.0 port = $port
+external: eth0
+method: username
+user.privileged: root
+user.notprivileged: nobody
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error connect disconnect
+}
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: bind connect udpassociate
+    log: error connect disconnect
+    method: username
+}
+DANTE_EOF
+useradd -M -s /bin/false $username
+echo '$username:$proxy_password' | chpasswd
+systemctl restart danted
+systemctl enable danted
+";
+            }
+            
+            file_put_contents($script_path, $script_content);
+            
+            // Копирование и выполнение скрипта на сервере
+            $remote_script = "/tmp/setup_proxy.sh";
+            $copy_cmd = "sshpass -p '{$server['password']}' scp -o StrictHostKeyChecking=no $script_path root@{$server['ip']}:$remote_script";
+            $exec_cmd = "sshpass -p '{$server['password']}' ssh -o StrictHostKeyChecking=no root@{$server['ip']} 'chmod +x $remote_script && $remote_script'";
+            
+            shell_exec($copy_cmd);
+            $output = shell_exec($exec_cmd);
+            
+            // Проверка успешности установки
+            $status = 'active'; // Можно добавить более детальную проверку
+            
+            $db->query("INSERT INTO proxies (server_id, type, ip, port, username, password, status) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                       [$server_id, $type, $server['ip'], $port, $username, $proxy_password, $status]);
+            
+            unlink($script_path);
+        }
+        
+        header('Location: index.php');
+        break;
+        
+    case 'test_proxy':
+        $id = $_GET['id'];
+        $proxy = $db->fetch("SELECT p.*, s.ip AS server_ip FROM proxies p LEFT JOIN servers s ON p.server_id = s.id WHERE p.id = ?", [$id]);
+
+        if (!$proxy) {
+            header('Location: index.php');
+            exit;
+        }
+
+        // Формируем URL прокси
+        $proxyUrl = '';
+        $proxyType = $proxy['type'];
+        $proxyUser = $proxy['username'];
+        $proxyPass = $proxy['password'];
+        $proxyIP = $proxy['server_ip'];
+        $proxyPort = $proxy['port'];
+
+        if ($proxyType == 'http') {
+            $proxyUrl = "http://$proxyUser:$proxyPass@$proxyIP:$proxyPort";
+        } else {
+            $proxyUrl = "socks5://$proxyUser:$proxyPass@$proxyIP:$proxyPort";
+        }
+
+        $testUrl = "http://ifconfig.me";
+
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $testUrl);
+        curl_setopt($ch, CURLOPT_PROXY, $proxyUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+        if ($proxyType == 'http') {
+            curl_setopt($ch, CURLOPT_PROXYAUTH, CURLAUTH_BASIC);
+        }
+
+        $response = curl_exec($ch);
+        $error = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        curl_close($ch);
+
+        if ($httpCode == 200 && !$error) {
+            $status = 'active';
+        } else {
+            $status = 'error';
+        }
+
+        $db->query("UPDATE proxies SET status = ? WHERE id = ?", [$status, $id]);
+        header('Location: index.php');
+        break;
+        
+    case 'delete_proxy':
+        $id = $_GET['id'];
+        $proxy = $db->fetch("SELECT p.*, s.* FROM proxies p JOIN servers s ON p.server_id = s.id WHERE p.id = ?", [$id]);
+        
+        if ($proxy) {
+            // Остановка прокси на сервере
+            if ($proxy['type'] == 'http') {
+                $stop_cmd = "sshpass -p '{$proxy['password']}' ssh -o StrictHostKeyChecking=no root@{$proxy['ip']} 'systemctl stop squid'";
+            } else {
+                $stop_cmd = "sshpass -p '{$proxy['password']}' ssh -o StrictHostKeyChecking=no root@{$proxy['ip']} 'systemctl stop danted'";
+            }
+            shell_exec($stop_cmd);
+            
+            $db->query("DELETE FROM proxies WHERE id = ?", [$id]);
+        }
+        
+        header('Location: index.php');
+        break;
+        
+    case 'logout':
+        session_destroy();
+        header('Location: login.php');
+        break;
+}
+?>
+EOF
+
+    # Создание logout.php
+    cat > public/logout.php << 'EOF'
+<?php
+session_start();
+session_destroy();
+header('Location: login.php');
+?>
+EOF
+
+    log "Веб-приложение создано"
+}
+
+# Настройка Nginx
+setup_nginx() {
+    log "Настройка Nginx..."
+    
+    cat > /etc/nginx/sites-available/proxy-admin << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    root /var/www/proxy-admin/public;
+    index index.php index.html;
+    
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+    
+    location ~ \.php$ {
+        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+    
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+    ln -sf /etc/nginx/sites-available/proxy-admin /etc/nginx/sites-enabled/
+    rm -f /etc/nginx/sites-enabled/default
+    
+    nginx -t && systemctl restart nginx
+    systemctl enable nginx
+    
+    log "Nginx настроен"
+}
+
+# Создание администратора
+create_admin() {
+    log "Создание администратора..."
+    
+    echo -n "Введите логин администратора: "
+    read ADMIN_USERNAME
+    echo -n "Введите пароль администратора: "
+    read -s ADMIN_PASSWORD
+    echo
+    
+    HASHED_PASSWORD=$(php -r "echo password_hash('$ADMIN_PASSWORD', PASSWORD_DEFAULT);")
+    
+    mysql -u root -p$DB_ROOT_PASS proxy_admin -e "INSERT INTO admin_users (username, password) VALUES ('$ADMIN_USERNAME', '$HASHED_PASSWORD');"
+    
+    log "Администратор создан"
+}
+
+# Установка SSH ключей
+setup_ssh_keys() {
+    log "Настройка SSH ключей..."
+    
+    if [ ! -f /root/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N ""
+        log "SSH ключи сгенерированы"
+    fi
+    
+    # Создание скрипта для копирования ключей
+    cat > /var/www/proxy-admin/scripts/copy_ssh_key.sh << 'EOF'
+#!/bin/bash
+SERVER_IP=$1
+SERVER_PASSWORD=$2
+
+sshpass -p "$SERVER_PASSWORD" ssh-copy-id -o StrictHostKeyChecking=no root@$SERVER_IP
+EOF
+    chmod +x /var/www/proxy-admin/scripts/copy_ssh_key.sh
+    log "SSH скрипт создан"
+}
+
+# Настройка прав
+setup_permissions() {
+    log "Настройка прав доступа..."
+    chown -R www-data:www-data /var/www/proxy-admin
+    find /var/www/proxy-admin -type d -exec chmod 755 {} \;
+    find /var/www/proxy-admin -type f -exec chmod 644 {} \;
+    chmod +x /var/www/proxy-admin/scripts/*.sh
+    log "Права настроены"
+}
+
+# Основной процесс
+main() {
+    check_root
+    install_dependencies
+    setup_mysql
+    create_web_app
+    setup_nginx
+    create_admin
+    setup_ssh_keys
+    setup_permissions
+    
+    PUBLIC_IP=$(curl -s ifconfig.me)
+    log "Установка завершена!"
+    log "Адрес панели: http://$PUBLIC_IP"
+    log "Логин: $ADMIN_USERNAME"
+    log "Пароль: указанный при установке"
+}
+
+main
