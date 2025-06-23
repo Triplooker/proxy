@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy Generator</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Proxy Generator</h1>
+
+        <div class="input-section">
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="ip-count">Количество IP:</label>
+                    <input type="number" id="ip-count" name="ip-count" value="10">
+                </div>
+                <div class="form-group">
+                    <label for="network">Сеть:</label>
+                    <input type="text" id="network" name="network" placeholder="e.g., 192.168.1.0">
+                </div>
+                <div class="form-group">
+                    <label for="mask">Маска:</label>
+                    <input type="text" id="mask" name="mask" placeholder="e.g., 24 or 255.255.255.0">
+                </div>
+                <div class="form-group">
+                    <label for="proxy-type">Тип прокси:</label>
+                    <select id="proxy-type" name="proxy-type">
+                        <option value="http" selected>HTTP</option>
+                        <option value="socks5">SOCKS5</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="login">Логин:</label>
+                    <input type="text" id="login" name="login" value="user">
+                </div>
+                <div class="form-group">
+                    <label for="password">Пароль:</label>
+                    <input type="text" id="password" name="password" value="pass123">
+                </div>
+            </div>
+            <div class="generate-button-container">
+                <button id="generate-btn" class="button">Сгенерировать</button>
+            </div>
+        </div>
+
+        <div class="output-section">
+            <h2>Сгенерированные прокси:</h2>
+            <textarea id="proxy-output" readonly></textarea>
+            <div class="output-buttons">
+                <button id="copy-btn" class="button">Скопировать</button>
+                <button id="download-btn" class="button">Скачать TXT</button>
+            </div>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
